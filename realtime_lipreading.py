@@ -25,11 +25,12 @@ from lipreading.dataloaders import get_preprocessing_pipelines
 class RealTimeLipreading:
     """实时唇语检测类"""
     
-    def __init__(self, config_path, model_path, label_path, 
-                 buffer_size=29, use_mediapipe=True, device='auto'):
+    def __init__(self, config_path, model_path, label_path,
+                 buffer_size=29, use_mediapipe=True, device='auto',
+                 history_duration=5.0, min_confidence=0.3):
         """
         初始化实时唇语检测系统
-        
+
         Args:
             config_path: 模型配置文件路径
             model_path: 预训练模型路径
@@ -37,6 +38,8 @@ class RealTimeLipreading:
             buffer_size: 帧缓冲大小（默认29帧）
             use_mediapipe: 是否使用MediaPipe进行人脸检测
             device: 运行设备 ('auto', 'cuda', 'cpu')
+            history_duration: 历史记录保留时长（秒）
+            min_confidence: 最小置信度阈值
         """
         # 设置设备
         self.device = self.setup_device(device)
@@ -68,6 +71,12 @@ class RealTimeLipreading:
         self.current_prediction = ""
         self.confidence = 0.0
         self.top5_predictions = []
+
+        # 识别历史记录（用于显示连续句子）
+        self.prediction_history = []  # 存储历史预测: [(word, confidence, timestamp), ...]
+        self.history_duration = history_duration  # 历史记录保留时长（秒）
+        self.min_confidence_threshold = min_confidence  # 最小置信度阈值，低于此值不记录
+        self.word_repeat_threshold = 1.0  # 相同单词重复间隔阈值（秒）
     
     def setup_device(self, device='auto'):
         """设置运行设备
@@ -350,10 +359,51 @@ class RealTimeLipreading:
         ]
         
         return prediction, confidence.item(), top5
-    
+
+    def update_prediction_history(self, prediction, confidence):
+        """更新预测历史记录
+
+        Args:
+            prediction: 预测的单词
+            confidence: 置信度
+        """
+        current_time = time.time()
+
+        # 清理过期的历史记录
+        self.prediction_history = [
+            (word, conf, ts) for word, conf, ts in self.prediction_history
+            if current_time - ts < self.history_duration
+        ]
+
+        # 检查是否应该添加新预测
+        if confidence < self.min_confidence_threshold:
+            return
+
+        # 检查是否与最近的预测重复（避免连续重复相同单词）
+        if self.prediction_history:
+            last_word, last_conf, last_time = self.prediction_history[-1]
+            if last_word == prediction and current_time - last_time < self.word_repeat_threshold:
+                return
+
+        # 添加新预测到历史记录
+        self.prediction_history.append((prediction, confidence, current_time))
+
+    def get_sentence(self):
+        """获取当前句子（历史预测组合）
+
+        Returns:
+            sentence: 组合后的句子字符串
+        """
+        if not self.prediction_history:
+            return ""
+
+        # 提取所有单词，按时间顺序排列
+        words = [word for word, conf, ts in self.prediction_history]
+        return " ".join(words)
+
     def draw_results(self, frame, face_bbox, mouth_bbox, fps):
         """在帧上绘制结果
-        
+
         Args:
             frame: 原始帧
             face_bbox: 人脸边界框
@@ -364,42 +414,74 @@ class RealTimeLipreading:
         if face_bbox:
             x_min, y_min, x_max, y_max = face_bbox
             cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
-        
+
         # 绘制嘴部边界框
         if mouth_bbox:
             x_min, y_min, x_max, y_max = mouth_bbox
             cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (255, 0, 0), 2)
-        
-        # 显示预测结果
+
+        # 显示当前预测结果
         y_offset = 30
-        cv2.putText(frame, f"Prediction: {self.current_prediction}", 
+        cv2.putText(frame, f"Current: {self.current_prediction}",
                    (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        
+
         y_offset += 30
-        cv2.putText(frame, f"Confidence: {self.confidence:.2f}", 
+        cv2.putText(frame, f"Confidence: {self.confidence:.2f}",
                    (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        
+
+        # 显示识别句子（历史记录组合）
+        sentence = self.get_sentence()
+        if sentence:
+            y_offset += 35
+            cv2.putText(frame, "Sentence:", 
+                       (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+            # 如果句子太长，需要换行显示
+            y_offset += 25
+            max_chars_per_line = 40
+            words = sentence.split()
+            current_line = ""
+
+            for word in words:
+                if len(current_line + " " + word) <= max_chars_per_line:
+                    current_line = current_line + " " + word if current_line else word
+                else:
+                    cv2.putText(frame, current_line,
+                               (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                    y_offset += 25
+                    current_line = word
+
+            if current_line:
+                cv2.putText(frame, current_line,
+                           (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                y_offset += 25
+
         # 显示Top-5预测
         if self.top5_predictions:
-            y_offset += 30
-            cv2.putText(frame, "Top-5:", 
+            y_offset += 10
+            cv2.putText(frame, "Top-5:",
                        (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-            
+
             for i, pred in enumerate(self.top5_predictions[:5]):
                 y_offset += 25
                 text = f"{i+1}. {pred['label']}: {pred['probability']:.3f}"
-                cv2.putText(frame, text, 
+                cv2.putText(frame, text,
                            (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-        
+
         # 显示FPS
-        cv2.putText(frame, f"FPS: {fps:.1f}", 
+        cv2.putText(frame, f"FPS: {fps:.1f}",
                    (frame.shape[1] - 120, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-        
+
         # 显示缓冲状态
         buffer_status = f"Buffer: {len(self.mouth_buffer)}/{self.buffer_size}"
-        cv2.putText(frame, buffer_status, 
+        cv2.putText(frame, buffer_status,
                    (frame.shape[1] - 200, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-        
+
+        # 显示历史记录数量
+        history_status = f"History: {len(self.prediction_history)} words"
+        cv2.putText(frame, history_status,
+                   (frame.shape[1] - 200, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
         return frame
     
     def run(self, camera_id=0, display=True):
@@ -466,11 +548,14 @@ class RealTimeLipreading:
                 # 当缓冲满时进行预测
                 if len(self.mouth_buffer) >= self.buffer_size:
                     prediction, confidence, top5 = self.predict(list(self.mouth_buffer))
-                    
+
                     if prediction:
                         self.current_prediction = prediction
                         self.confidence = confidence
                         self.top5_predictions = top5
+
+                        # 更新历史记录
+                        self.update_prediction_history(prediction, confidence)
                 
                 # 绘制结果
                 if display:
@@ -488,6 +573,7 @@ class RealTimeLipreading:
                     self.current_prediction = ""
                     self.confidence = 0.0
                     self.top5_predictions = []
+                    self.prediction_history = []  # 清空历史记录
                     print("缓冲已重置")
                 elif key == ord('s'):
                     # 保存当前帧
@@ -539,7 +625,13 @@ def main():
     # 设备参数
     parser.add_argument('--device', default='auto', choices=['auto', 'cuda', 'cpu'],
                        help='运行设备: auto(自动检测), cuda(GPU), cpu (默认: auto)')
-    
+
+    # 历史记录参数
+    parser.add_argument('--history-duration', type=float, default=5.0,
+                       help='识别历史记录保留时长（秒），用于显示连续句子 (默认: 5.0)')
+    parser.add_argument('--min-confidence', type=float, default=0.3,
+                       help='最小置信度阈值，低于此值的预测不记录到历史 (默认: 0.3)')
+
     args = parser.parse_args()
     
     # 创建实时检测器
@@ -549,7 +641,9 @@ def main():
         label_path=args.label_path,
         buffer_size=args.buffer_size,
         use_mediapipe=args.use_mediapipe,
-        device=args.device
+        device=args.device,
+        history_duration=args.history_duration,
+        min_confidence=args.min_confidence
     )
     
     # 运行检测

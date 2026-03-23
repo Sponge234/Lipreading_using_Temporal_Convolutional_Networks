@@ -46,7 +46,7 @@
 ## 📁 创建的文件
 
 ### 核心文件
-- `realtime_lipreading.py` - 实时检测主程序（约600行）
+- `realtime_lipreading.py` - 实时检测主程序
 - `start_realtime.sh` - 快速启动脚本
 - `REALTIME_GUIDE.md` - 详细使用指南
 
