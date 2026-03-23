@@ -265,64 +265,68 @@ class RealTimeLipreading:
         
         return (x, y, x+w, y+h), (mouth_x, mouth_y, mouth_x+mouth_w, mouth_y+mouth_h)
     
-    def extract_mouth_roi(self, frame, mouth_bbox, target_size=96):
+    def extract_mouth_roi(self, frame, mouth_bbox, target_size=88):
         """提取并预处理嘴部区域
-        
+
         Args:
             frame: 原始帧
             mouth_bbox: 嘴部边界框 (x_min, y_min, x_max, y_max)
-            target_size: 目标尺寸
-        
+            target_size: 目标尺寸，必须与预处理配置中的crop_size一致(88x88)
+
         Returns:
-            mouth_roi: 处理后的嘴部区域 (96, 96)
+            mouth_roi: 处理后的嘴部区域 (88, 88)
         """
         if mouth_bbox is None:
             return None
-        
+
         x_min, y_min, x_max, y_max = mouth_bbox
-        
+
         # 确保边界框有效
         if x_max <= x_min or y_max <= y_min:
             return None
-        
+
         # 裁剪嘴部区域
         mouth_roi = frame[y_min:y_max, x_min:x_max]
-        
+
         if mouth_roi.size == 0:
             return None
-        
+
         # 转换为灰度图
         if len(mouth_roi.shape) == 3:
             mouth_roi = cv2.cvtColor(mouth_roi, cv2.COLOR_BGR2GRAY)
-        
-        # 调整大小到96x96
+
+        # 调整大小到target_size x target_size (与预处理配置中的crop_size一致)
         mouth_roi = cv2.resize(mouth_roi, (target_size, target_size))
-        
+
         return mouth_roi
     
     def preprocess_sequence(self, mouth_sequence):
         """预处理嘴部序列
-        
+
         Args:
             mouth_sequence: 嘴部序列 (T, H, W)
-        
+
         Returns:
             processed: 预处理后的tensor
         """
-        # 应用预处理
+        # 将列表转换为numpy数组
+        mouth_sequence = np.array(mouth_sequence, dtype=np.float32)
+
+        # 应用预处理流程
+        # 预处理包括: Normalize(0.0,255.0) -> CenterCrop(88,88) -> Normalize(0.421, 0.165)
         processed = self.preprocessing(mouth_sequence)
-        
+
         # 转换为tensor
         processed = torch.from_numpy(processed).float()
-        
+
         return processed
     
     def predict(self, mouth_sequence):
         """进行预测
-        
+
         Args:
             mouth_sequence: 嘴部序列 (T, H, W)
-        
+
         Returns:
             prediction: 预测的单词
             confidence: 置信度
@@ -330,34 +334,46 @@ class RealTimeLipreading:
         """
         if len(mouth_sequence) < self.buffer_size:
             return None, 0.0, []
-        
+
         # 预处理
         start_time = time.time()
-        processed = self.preprocess_sequence(np.array(mouth_sequence))
-        
+        processed = self.preprocess_sequence(mouth_sequence)
+
         # 准备输入
+        # 输入形状应该是 [1, 1, T, H, W]，其中H和W应该是88
         input_tensor = processed.unsqueeze(0).unsqueeze(0).to(self.device)  # [1, 1, T, H, W]
         lengths = torch.tensor([len(mouth_sequence)]).to(self.device)
-        
+
         # 推理
         with torch.no_grad():
             logits = self.model(input_tensor, lengths=lengths)
+
+            # 检查logits的形状和数值范围
+            # logits形状应该是 [1, num_classes]
+            # 应用softmax将logits转换为概率分布
             probs = torch.nn.functional.softmax(logits, dim=1)
+
+            # 获取最大概率和对应的索引
             confidence, pred_idx = torch.max(probs, dim=1)
-            
+
             # Top-5预测
             top5_probs, top5_indices = torch.topk(probs, k=5, dim=1)
-        
+
         inference_time = time.time() - start_time
         self.inference_times.append(inference_time)
-        
+
         # 构造结果
         prediction = self.labels[pred_idx.item()]
         top5 = [
             {'label': self.labels[idx.item()], 'probability': prob.item()}
             for idx, prob in zip(top5_indices[0], top5_probs[0])
         ]
-        
+
+        # 调试信息（可以移除这些打印语句）
+        if inference_time > 0.1:  # 只在推理时间较长时打印
+            print(f"Debug: input_shape={input_tensor.shape}, logits_range=[{logits.min():.2f}, {logits.max():.2f}], "
+                  f"max_prob={confidence.item():.4f}, prediction={prediction}")
+
         return prediction, confidence.item(), top5
 
     def update_prediction_history(self, prediction, confidence):
